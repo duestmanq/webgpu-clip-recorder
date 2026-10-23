@@ -1,0 +1,2 @@
+{ "name": "webgpu-clip-recorder", "private": true, "type": "module",
+  "dependencies": { "playwright": "1.64.1", "ffmpeg-static": "5.2.0", "ffprobe-static": "3.1.0" } }

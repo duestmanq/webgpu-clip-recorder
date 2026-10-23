@@ -1,0 +1,96 @@
+name: record-webgpu-clips
+on:
+  workflow_dispatch:
+    inputs:
+      games:
+        description: 'Game URLs or grokgames.json slugs (space/comma/newline separated)'
+        required: true
+        default: 'https://towersofaurum.com/ breakable-js nfsu2-web'
+      duration:
+        description: 'Clip length in seconds'
+        default: '30'
+      warmup:
+        description: 'Seconds to wait after load before recording (Start/Play is clicked halfway)'
+        default: '15'
+      headless:
+        description: 'Run Chromium headless (default headed)'
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: record-${{ github.run_id }}
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.r.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: r
+        env:
+          GAMES_INPUT: ${{ inputs.games }}
+        run: |
+          m=$(python3 scripts/resolve.py)
+          echo "$m" | python3 -m json.tool
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+  record:
+    needs: plan
+    runs-on: macos-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        game: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    name: record ${{ matrix.game.slug }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install --no-audit --no-fund
+      - run: npx playwright install chromium
+      - name: Record
+        env:
+          URL: ${{ matrix.game.url }}
+          SLUG: ${{ matrix.game.slug }}
+          TITLE: ${{ matrix.game.title }}
+          DURATION: ${{ inputs.duration }}
+          WARMUP: ${{ inputs.warmup }}
+          HEADLESS: ${{ inputs.headless && '--headless' || '' }}
+        run: node scripts/record.mjs --url "$URL" --slug "$SLUG" --title "$TITLE" --duration "$DURATION" --warmup "$WARMUP" --out out $HEADLESS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: clip-${{ matrix.game.slug }}
+          path: out/
+          if-no-files-found: warn
+  report:
+    needs: record
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { pattern: clip-*, path: clips, merge-multiple: true }
+      - name: Merge report
+        run: |
+          python3 - <<'PY'
+          import json, glob, os
+          rs = [json.load(open(f)) for f in sorted(glob.glob('clips/*.json'))]
+          json.dump(rs, open('report.json', 'w'), indent=2)
+          lines = ['| game | adapter | rAF fps | GPU submits/s | changed fps | verdict | ok |', '|---|---|---|---|---|---|---|']
+          for r in rs:
+              a = (r.get('gpu') or {}).get('adapter') or {}
+              ip = r.get('inPage') or {}; v = r.get('video') or {}; c = r.get('check') or {}
+              lines.append(f"| {r['slug']} | {a.get('vendor')} {a.get('architecture') or ''} | {ip.get('rafFps')} | {ip.get('gpuSubmitsPerSec')} | {v.get('changedFps')} | {c.get('verdict')} | {r.get('ok')} {r.get('error') or ''} |")
+          open(os.environ['GITHUB_STEP_SUMMARY'], 'a').write('\n'.join(lines) + '\n')
+          print('\n'.join(lines))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: all-clips
+          path: |
+            report.json
+            clips/*.mp4
+            clips/*.jpg
+            clips/*.json
