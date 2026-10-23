@@ -10,7 +10,10 @@ on:
         description: 'Clip length in seconds'
         default: '30'
       warmup:
-        description: 'Seconds to wait after load before recording (Start/Play is clicked halfway)'
+        description: 'Seconds after page load before clicking Start/Play'
+        default: '10'
+      settle:
+        description: 'Seconds after the Start/Play click before recording begins'
         default: '15'
       headless:
         description: 'Run Chromium headless (default headed)'
@@ -57,8 +60,9 @@ jobs:
           TITLE: ${{ matrix.game.title }}
           DURATION: ${{ inputs.duration }}
           WARMUP: ${{ inputs.warmup }}
+          SETTLE: ${{ inputs.settle }}
           HEADLESS: ${{ inputs.headless && '--headless' || '' }}
-        run: node scripts/record.mjs --url "$URL" --slug "$SLUG" --title "$TITLE" --duration "$DURATION" --warmup "$WARMUP" --out out $HEADLESS
+        run: node scripts/record.mjs --url "$URL" --slug "$SLUG" --title "$TITLE" --duration "$DURATION" --warmup "$WARMUP" --settle "$SETTLE" --out out $HEADLESS
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -94,3 +98,4 @@ jobs:
             clips/*.mp4
             clips/*.jpg
             clips/*.json
+            clips/*.png

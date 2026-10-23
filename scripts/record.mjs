@@ -10,12 +10,12 @@ import { parseArgs } from 'node:util';
 
 const { values: o } = parseArgs({ options: {
   url: { type: 'string' }, slug: { type: 'string' }, title: { type: 'string', default: '' },
-  duration: { type: 'string', default: '30' }, warmup: { type: 'string', default: '15' },
+  duration: { type: 'string', default: '30' }, warmup: { type: 'string', default: '10' }, settle: { type: 'string', default: '10' },
   out: { type: 'string', default: 'out' }, width: { type: 'string', default: '1280' }, height: { type: 'string', default: '720' },
   headless: { type: 'boolean', default: false },
 } });
 if (!o.url || !o.slug) throw new Error('--url and --slug required');
-const DUR = Number(o.duration), WARM = Number(o.warmup), W = Number(o.width), H = Number(o.height);
+const DUR = Number(o.duration), WARM = Number(o.warmup), SETTLE = Number(o.settle), W = Number(o.width), H = Number(o.height);
 const OUT = path.resolve(o.out); fs.mkdirSync(OUT, { recursive: true });
 const ARGS = ['--enable-gpu', '--ignore-gpu-blocklist', '--enable-unsafe-webgpu', '--use-angle=metal',
   // keep Chrome off the local network (macOS "find devices on local networks" prompt) and quiet
@@ -23,7 +23,7 @@ const ARGS = ['--enable-gpu', '--ignore-gpu-blocklist', '--enable-unsafe-webgpu'
   '--disable-background-networking', '--no-first-run', '--no-default-browser-check', '--disable-sync',
   '--autoplay-policy=no-user-gesture-required'];
 const report = { slug: o.slug, title: o.title, url: o.url, platform: `${process.platform}-${process.arch}`, args: ARGS,
-  headless: o.headless, durationSec: DUR, warmupSec: WARM, startedAt: new Date().toISOString(), console: [], pageErrors: [] };
+  headless: o.headless, durationSec: DUR, warmupSec: WARM, settleSec: SETTLE, startedAt: new Date().toISOString(), console: [], pageErrors: [] };
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const withTimeout = (p, ms, v = null) => Promise.race([p, sleep(ms).then(() => v)]);
@@ -47,28 +47,28 @@ const PROBE = async () => {
   return r;
 };
 
+// Find a visible Start/Play control with one DOM pass (fast even when the page is busy), then click it.
 async function clickStart(page) {
-  const clicked = [];
-  const exact = /^\s*(start|play|play now|play game|start game|start playing|click to play|tap to play|click to start|tap to start|press start|begin|enter|launch|let'?s go|continue)\s*[!▶►>]*\s*$/i;
-  for (const role of ['button', 'link']) {
-    const loc = page.getByRole(role, { name: exact });
-    const n = await loc.count().catch(() => 0);
-    for (let i = 0; i < n && clicked.length < 1; i++) {
-      const el = loc.nth(i);
-      if (await el.isVisible().catch(() => false)) {
-        const t = (await el.innerText().catch(() => '')).trim().slice(0, 40);
-        await el.click({ timeout: 5000 }).then(() => clicked.push(`${role}:${t}`)).catch(() => {});
-      }
+  const hit = await withTimeout(page.evaluate(() => {
+    const KEY = String.raw`(\s*(enter|space|↵|⏎|return))?`;
+    const exact = new RegExp(String.raw`^\s*[▶►>]?\s*(start|play|play now|play game|start game|start playing|click to play|tap to play|click to start|tap to start|press start|begin|launch)\s*[!▶►>]*` + KEY + String.raw`\s*$`, 'i');
+    const vis = el => { const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
+      return r.width > 4 && r.height > 4 && r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth && cs.visibility !== 'hidden' && cs.display !== 'none' && +cs.opacity > 0.05 ? r : null; };
+    const els = [...document.querySelectorAll('button, a, [role=button], input[type=button], input[type=submit], .btn, .button')];
+    for (const el of els) {
+      const t = (el.innerText || el.value || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+      const r = t && exact.test(t) && vis(el);
+      if (r) return { how: 'button:' + t.slice(0, 40), x: r.left + r.width / 2, y: r.top + r.height / 2 };
     }
-  }
-  if (!clicked.length) {
-    const txt = await withTimeout(page.evaluate(() => document.body?.innerText || ''), 5000, '');
-    if (/(click|tap)( anywhere)? to (play|start|begin)|press any key|click anywhere/i.test(txt)) {
-      await page.mouse.click(W / 2, H / 2, { timeout: 5000 }).catch(() => {}); clicked.push('center-click');
-      await page.keyboard.press('Enter').catch(() => {});
-    }
-  }
-  return clicked;
+    const txt = document.body ? document.body.innerText : '';
+    if (/(click|tap)( anywhere)? to (play|start|begin)|press any key|click anywhere/i.test(txt)) return { how: 'center-click', x: innerWidth / 2, y: innerHeight / 2 };
+    return null;
+  }), 15000, 'timeout');
+  if (!hit) return [];
+  if (hit === 'timeout') return ['evaluate-timeout'];
+  await withTimeout(page.mouse.click(hit.x, hit.y), 5000);
+  if (hit.how === 'center-click') await withTimeout(page.keyboard.press('Enter'), 3000);
+  return [hit.how];
 }
 
 // Video analysis: per-sample luma mean/std and motion between samples.
@@ -115,10 +115,13 @@ try {
   await page.goto(o.url, { waitUntil: 'load', timeout: 90000 }).catch(e => { report.gotoError = e.message.split('\n')[0]; });
   report.gpu = await withTimeout(page.evaluate(PROBE), 15000, { error: 'probe timeout' });
   log('gpu', JSON.stringify(report.gpu));
-  await sleep(WARM * 500);
-  report.startClicks = await withTimeout(clickStart(page), 20000, ['timeout']);
+  await sleep(WARM * 1000);
+  report.startClicks = await clickStart(page);
   log('start clicks', report.startClicks);
-  await sleep(WARM * 500);
+  await withTimeout(page.screenshot({ path: path.join(OUT, `${o.slug}-after-click.png`), timeout: 10000 }).catch(() => {}), 12000);
+  await sleep(SETTLE * 1000);
+  // a second pass catches two-step menus (e.g. "Play" then "Start")
+  if (report.startClicks.length) { const more = await clickStart(page); if (more.length) { report.startClicks.push(...more); await sleep(Math.min(SETTLE, 5) * 1000); } }
   const recStart = (Date.now() - t0) / 1000;
   const c0 = await withTimeout(page.evaluate(() => ({ ...window.__ctr, now: performance.now() })), 10000);
   const tEnd = Date.now() + DUR * 1000; let i = 0;
