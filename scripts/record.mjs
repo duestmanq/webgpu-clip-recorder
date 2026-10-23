@@ -10,7 +10,7 @@ import { parseArgs } from 'node:util';
 
 const { values: o } = parseArgs({ options: {
   url: { type: 'string' }, slug: { type: 'string' }, title: { type: 'string', default: '' },
-  duration: { type: 'string', default: '30' }, warmup: { type: 'string', default: '10' }, settle: { type: 'string', default: '10' },
+  duration: { type: 'string', default: '30' }, warmup: { type: 'string', default: '60' }, settle: { type: 'string', default: '10' },
   out: { type: 'string', default: 'out' }, width: { type: 'string', default: '1280' }, height: { type: 'string', default: '720' },
   headless: { type: 'boolean', default: false },
 } });
@@ -48,10 +48,24 @@ const PROBE = async () => {
 };
 
 // Find a visible Start/Play control with one DOM pass (fast even when the page is busy), then click it.
-async function clickStart(page) {
-  const hit = await withTimeout(page.evaluate(() => {
+// Poll until the page answers quickly and rAF runs >= minFps for two polls in a row (or maxSec passes).
+async function waitReady(page, minSec, maxSec, minFps = 20) {
+  const t = Date.now(); let last = null, good = 0, fps = null;
+  while ((Date.now() - t) / 1000 < maxSec) {
+    await sleep(2000);
+    const c = await withTimeout(page.evaluate(() => window.__ctr ? { raf: window.__ctr.raf, now: performance.now(), id: window.__ctr.id } : null).catch(() => null), 3000);
+    if (c && last && c.id === last.id) { fps = (c.raf - last.raf) / ((c.now - last.now) / 1000); good = fps >= minFps ? good + 1 : 0; } else good = 0;
+    last = c;
+    if (good >= 2 && (Date.now() - t) / 1000 >= minSec) break;
+  }
+  return { waitedSec: +((Date.now() - t) / 1000).toFixed(1), fps: fps === null ? null : +fps.toFixed(1), ready: good >= 2 };
+}
+
+const DISMISS = String.raw`^\s*(not now|no thanks|no,? thanks|skip|got it|ok|okay|accept|accept all|allow all|agree|i agree|close|dismiss|later|maybe later|×|✕)\s*$`;
+async function clickStart(page, pattern = null) {
+  const hit = await withTimeout(page.evaluate((pattern) => {
     const KEY = String.raw`(\s*(enter|space|↵|⏎|return))?`;
-    const exact = new RegExp(String.raw`^\s*[▶►>]?\s*(start|play|play now|play game|start game|start playing|click to play|tap to play|click to start|tap to start|press start|begin|launch)\s*[!▶►>]*` + KEY + String.raw`\s*$`, 'i');
+    const exact = pattern ? new RegExp(pattern, 'i') : new RegExp(String.raw`^\s*[▶►>]?\s*(start|play|play now|play game|start game|start playing|click to play|tap to play|click to start|tap to start|press start|begin|launch)\s*[!▶►>]*` + KEY + String.raw`\s*$`, 'i');
     const vis = el => { const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
       return r.width > 4 && r.height > 4 && r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth && cs.visibility !== 'hidden' && cs.display !== 'none' && +cs.opacity > 0.05 ? r : null; };
     const els = [...document.querySelectorAll('button, a, [role=button], input[type=button], input[type=submit], .btn, .button')];
@@ -60,10 +74,11 @@ async function clickStart(page) {
       const r = t && exact.test(t) && vis(el);
       if (r) return { how: 'button:' + t.slice(0, 40), x: r.left + r.width / 2, y: r.top + r.height / 2 };
     }
+    if (pattern) return null;
     const txt = document.body ? document.body.innerText : '';
     if (/(click|tap)( anywhere)? to (play|start|begin)|press any key|click anywhere/i.test(txt)) return { how: 'center-click', x: innerWidth / 2, y: innerHeight / 2 };
     return null;
-  }), 15000, 'timeout');
+  }, pattern), 15000, 'timeout');
   if (!hit) return [];
   if (hit === 'timeout') return ['evaluate-timeout'];
   await withTimeout(page.mouse.click(hit.x, hit.y), 5000);
@@ -115,13 +130,21 @@ try {
   await page.goto(o.url, { waitUntil: 'load', timeout: 90000 }).catch(e => { report.gotoError = e.message.split('\n')[0]; });
   report.gpu = await withTimeout(page.evaluate(PROBE), 15000, { error: 'probe timeout' });
   log('gpu', JSON.stringify(report.gpu));
-  await sleep(WARM * 1000);
-  report.startClicks = await clickStart(page);
-  log('start clicks', report.startClicks);
-  await withTimeout(page.screenshot({ path: path.join(OUT, `${o.slug}-after-click.png`), timeout: 10000 }).catch(() => {}), 12000);
-  await sleep(SETTLE * 1000);
-  // a second pass catches two-step menus (e.g. "Play" then "Start")
-  if (report.startClicks.length) { const more = await clickStart(page); if (more.length) { report.startClicks.push(...more); await sleep(Math.min(SETTLE, 5) * 1000); } }
+  report.ready = { load: await waitReady(page, 5, WARM) };
+  report.startClicks = [];
+  // up to 4 rounds: dismiss modals/consent, else click Start/Play; stop when nothing is left to click
+  for (let round = 0; round < 4; round++) {
+    let d = await clickStart(page, DISMISS);
+    if (d[0] === 'evaluate-timeout') { report.startClicks.push('page busy'); if (round > 0) break; d = []; }
+    const c = d.length ? [] : await clickStart(page);
+    const got = [...d.map(x => 'dismiss ' + x), ...c];
+    if (!got.length || got[0] === 'evaluate-timeout' && round > 0) break;
+    report.startClicks.push(...got); log('clicked', got);
+    if (round === 0) await withTimeout(page.screenshot({ path: path.join(OUT, `${o.slug}-after-click.png`), timeout: 10000 }).catch(() => {}), 12000);
+    await sleep(4000);
+  }
+  report.ready.afterStart = await waitReady(page, SETTLE, SETTLE + 60);
+  log('ready', JSON.stringify(report.ready));
   const recStart = (Date.now() - t0) / 1000;
   const c0 = await withTimeout(page.evaluate(() => ({ ...window.__ctr, now: performance.now() })), 10000);
   const tEnd = Date.now() + DUR * 1000; let i = 0;

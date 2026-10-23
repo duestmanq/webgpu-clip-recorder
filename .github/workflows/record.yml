@@ -10,10 +10,10 @@ on:
         description: 'Clip length in seconds'
         default: '30'
       warmup:
-        description: 'Seconds after page load before clicking Start/Play'
-        default: '10'
+        description: 'Max seconds to wait after load for the page to run smoothly before clicking Start/Play'
+        default: '60'
       settle:
-        description: 'Seconds after the Start/Play click before recording begins'
+        description: 'Min seconds after the Start/Play click before recording (waits up to +60s more for smooth fps)'
         default: '15'
       headless:
         description: 'Run Chromium headless (default headed)'
@@ -40,7 +40,7 @@ jobs:
   record:
     needs: plan
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       max-parallel: 5
